@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::thread::{self, JoinHandle};
+use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::thread::{self};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
@@ -12,27 +12,10 @@ use windows::Win32::NetworkManagement::IpHelper::{
 
 use crate::{report_error_log, report_info_log};
 
-const DEFAULT_PING_TARGET: &str = "8.8.8.8";
-const DEFAULT_PING_COUNT: usize = 4;
-const DEFAULT_PING_TIMEOUT_MS: u32 = 1000;
-const DEFAULT_PROBE_INTERVAL_SECS: u64 = 10;
-const IP_FAMILY_IPV4: u32 = 2;
-
-static QUALITY_RUNNING: AtomicBool = AtomicBool::new(false);
-static QUALITY_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
-
-// 网络质量采样结果：用于记录一次探测周期内的主要指标
-#[derive(Debug, Clone)]
-struct NetworkQualitySample {
-    latency_avg_ms: Option<u32>,
-    latency_min_ms: Option<u32>,
-    latency_max_ms: Option<u32>,
-    jitter_ms: Option<u32>,
-    packet_loss_percent: Option<f32>,
-    tcp_retransmission_percent: Option<f32>,
-    tcp_segments_sent: Option<u64>,
-    tcp_segments_retransmitted: Option<u64>,
-}
+use crate::global::{
+    DEFAULT_PING_COUNT, DEFAULT_PING_TARGET, DEFAULT_PING_TIMEOUT_MS, DEFAULT_PROBE_INTERVAL_SECS,
+    IP_FAMILY_IPV4, NetworkQualitySample, PingStats, QUALITY_RUNNING, QUALITY_THREAD, TcpStats,
+};
 
 // 启动网络质量探测线程：周期性采样并输出到日志
 pub fn start_quality_probe() {
@@ -105,16 +88,6 @@ fn report_quality_sample(sample: &NetworkQualitySample) {
         sample.tcp_segments_sent,
         sample.tcp_segments_retransmitted
     );
-}
-
-// ICMP 探测结果：用于计算延迟、抖动与丢包
-#[derive(Debug)]
-struct PingStats {
-    avg_ms: u32,
-    min_ms: u32,
-    max_ms: u32,
-    jitter_ms: u32,
-    loss_percent: f32,
 }
 
 // 计算指定目标的延迟与丢包率
@@ -196,14 +169,6 @@ fn compute_jitter(rtts: &[u32]) -> u32 {
         sum += diff;
     }
     sum / (rtts.len() as u32 - 1)
-}
-
-// TCP 统计结果：用于计算重传率并补充其他质量指标
-#[derive(Debug)]
-struct TcpStats {
-    retransmission_percent: f32,
-    segments_sent: u64,
-    segments_retransmitted: u64,
 }
 
 // 读取系统 TCP 统计并计算重传率

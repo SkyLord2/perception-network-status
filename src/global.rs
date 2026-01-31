@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::{Mutex, OnceLock};
+use std::thread::JoinHandle;
 use std::time::Instant;
 
 use chrono::Local;
@@ -35,6 +36,46 @@ pub struct SignalMonitorContext {
     pub threshold_recover: u32,
     pub is_signal_weak: bool,
     pub last_quality: u32,
+}
+
+pub const DEFAULT_PING_TARGET: &str = "8.8.8.8";
+pub const DEFAULT_PING_COUNT: usize = 4;
+pub const DEFAULT_PING_TIMEOUT_MS: u32 = 1000;
+pub const DEFAULT_PROBE_INTERVAL_SECS: u64 = 10;
+pub const IP_FAMILY_IPV4: u32 = 2;
+
+pub static QUALITY_RUNNING: AtomicBool = AtomicBool::new(false);
+pub static QUALITY_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+
+// 网络质量采样结果：用于记录一次探测周期内的主要指标
+#[derive(Debug, Clone)]
+pub(crate) struct NetworkQualitySample {
+    pub latency_avg_ms: Option<u32>,
+    pub latency_min_ms: Option<u32>,
+    pub latency_max_ms: Option<u32>,
+    pub jitter_ms: Option<u32>,
+    pub packet_loss_percent: Option<f32>,
+    pub tcp_retransmission_percent: Option<f32>,
+    pub tcp_segments_sent: Option<u64>,
+    pub tcp_segments_retransmitted: Option<u64>,
+}
+
+// TCP 统计结果：用于计算重传率并补充其他质量指标
+#[derive(Debug)]
+pub(crate) struct TcpStats {
+    pub retransmission_percent: f32,
+    pub segments_sent: u64,
+    pub segments_retransmitted: u64,
+}
+
+// ICMP 探测结果：用于计算延迟、抖动与丢包
+#[derive(Debug)]
+pub(crate) struct PingStats {
+    pub avg_ms: u32,
+    pub min_ms: u32,
+    pub max_ms: u32,
+    pub jitter_ms: u32,
+    pub loss_percent: f32,
 }
 
 // 监控相关的全局状态，统一保存在 global.rs 里
