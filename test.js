@@ -2,21 +2,24 @@ const { doInitialize } = require('./index.js')
 
 
 doInitialize(
-    (status) => {
+    (err, {status}) => {
       if (status === 1) {
-        console.log('network connected');  
+        console.log('网络已连接');  
       } else {
-        console.log('network disconnected');
+        console.log('网络已断开');
       } 
     },
-    (strong, quality, rssi) => {
-      console.log('wifi signal become strong', strong);
-      console.log(`wifi quality: ${quality}%`);
-      console.log(`wifi signal strength: ${rssi}dBm`);
+    (err, {strong, quality, rssi}) => {
+      console.log('wifi信号变强', strong);
+      console.log(`wifi质量: ${quality}%`);
+      console.log(`wifi信号强度: ${rssi}dBm`);
     },
     40,
     50,
-    (log) => {
+    (err, info) => {
+        console.log('网络质量: ', info);
+    },
+    (err, log) => {
       console.log("addon log: ", log);
         
     }
