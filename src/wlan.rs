@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::atomic::Ordering;
 
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, WIN32_ERROR};
 use windows::Win32::NetworkManagement::WiFi::{
@@ -11,8 +12,10 @@ use windows::Win32::NetworkManagement::WiFi::{
 };
 use windows::core::{Error as WinError, GUID, HRESULT, Result as WinResult};
 
-use crate::global::{ARGS, SignalMonitorContext, with_monitor_state};
-use crate::messages::send_wlan_status_message;
+use crate::global::{
+    SignalMonitorContext, THRESHOLD_DROP, THRESHOLD_RECOVER, WlanStatus, report_wlan_status,
+    with_monitor_state, with_monitor_state_ref,
+};
 use crate::{report_error_log, report_info_log};
 
 const DEFAULT_SIGNAL_DROP: u32 = 30;
@@ -36,12 +39,27 @@ pub fn initialize_wlan_monitor() -> WinResult<()> {
     }
 
     let (threshold_drop, threshold_recover) = resolve_signal_thresholds();
+
+    let mut is_signal_weak = false;
+    let mut last_quality = 0;
+
+    if let Some(guid) = interface_guid
+        && let Some((quality, _rssi)) = query_interface_signal(wlan_handle, &guid)
+    {
+        if quality < threshold_drop {
+            is_signal_weak = true;
+        } else if quality >= threshold_recover {
+            is_signal_weak = false;
+        }
+        last_quality = quality;
+    }
+
     let mut context = Box::new(SignalMonitorContext {
         wlan_handle,
         threshold_drop,
         threshold_recover,
-        is_signal_weak: false,
-        last_quality: 0,
+        is_signal_weak,
+        last_quality,
     });
     let context_ptr = context.as_mut() as *mut SignalMonitorContext as *mut c_void;
 
@@ -62,12 +80,6 @@ pub fn initialize_wlan_monitor() -> WinResult<()> {
         )
     };
     check_win32(WIN32_ERROR(register_result), "WlanRegisterNotification")?;
-
-    if let Some(guid) = interface_guid
-        && let Some((quality, rssi)) = query_interface_signal(wlan_handle, &guid)
-    {
-        send_wlan_status_message(quality, rssi);
-    }
 
     Ok(())
 }
@@ -115,7 +127,6 @@ unsafe extern "system" fn wlan_notification_callback(
     if notification.NotificationCode == wlan_notification_msm_disconnected.0 as u32 {
         context.last_quality = 0;
         context.is_signal_weak = false;
-        send_wlan_status_message(0, 0);
         return;
     }
 
@@ -123,8 +134,7 @@ unsafe extern "system" fn wlan_notification_callback(
         || notification.NotificationCode == wlan_notification_msm_signal_quality_change.0 as u32)
         && let Some((quality, rssi)) = query_interface_signal(context.wlan_handle, interface_guid)
     {
-        update_signal_state(context, quality);
-        send_wlan_status_message(quality, rssi);
+        update_signal_state(context, quality, rssi);
     }
 }
 
@@ -172,15 +182,25 @@ fn query_interface_signal(handle: HANDLE, interface_guid: &GUID) -> Option<(u32,
 
     let attributes = unsafe { &*(data_ptr as *const WLAN_CONNECTION_ATTRIBUTES) };
     let quality = attributes.wlanAssociationAttributes.wlanSignalQuality;
-    let rssi = 0;
+    let rssi = quality_to_rssi(quality);
 
     unsafe { WlanFreeMemory(data_ptr) };
 
     Some((quality, rssi))
 }
 
+fn quality_to_rssi(quality: u32) -> i32 {
+    if quality == 0 {
+        -100
+    } else if quality >= 100 {
+        -50
+    } else {
+        ((quality as f32) / 2.0) as i32 - 100
+    }
+}
+
 // 根据信号质量更新弱信号状态，避免频繁抖动
-fn update_signal_state(context: &mut SignalMonitorContext, quality: u32) {
+fn update_signal_state(context: &mut SignalMonitorContext, quality: u32, rssi: i32) {
     let was_weak = context.is_signal_weak;
 
     if quality <= context.threshold_drop {
@@ -192,19 +212,30 @@ fn update_signal_state(context: &mut SignalMonitorContext, quality: u32) {
     context.last_quality = quality;
 
     if was_weak != context.is_signal_weak {
-        if context.is_signal_weak {
+        let strong = if context.is_signal_weak {
             report_info_log!("WiFi 信号进入弱信号区间，质量={}", quality);
+            0
         } else {
             report_info_log!("WiFi 信号恢复，质量={}", quality);
-        }
+            1
+        };
+
+        with_monitor_state_ref(|state| {
+            if state.network_connected {
+                report_wlan_status(WlanStatus {
+                    strong,
+                    quality,
+                    rssi,
+                });
+            }
+        });
     }
 }
 
 // 从初始化参数解析阈值，未提供时使用默认值
 fn resolve_signal_thresholds() -> (u32, u32) {
-    let args = ARGS.load(std::sync::atomic::Ordering::SeqCst);
-    let drop = args & 0xFFFF;
-    let recover = (args >> 16) & 0xFFFF;
+    let drop = THRESHOLD_DROP.load(Ordering::SeqCst);
+    let recover = THRESHOLD_RECOVER.load(Ordering::SeqCst);
 
     let drop = if drop == 0 { DEFAULT_SIGNAL_DROP } else { drop };
     let mut recover = if recover == 0 {

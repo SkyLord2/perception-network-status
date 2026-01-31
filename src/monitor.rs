@@ -8,8 +8,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, TranslateMessage, WM_QUIT,
 };
 
-use crate::global::{MONITOR_STARTED, MONITOR_THREAD_ID, with_monitor_state};
-use crate::messages::{WM_NETWORK_STATUS_CHANGE, WM_WIFI_SIGNAL_CHANGE};
+use crate::global::{MONITOR_STARTED, MONITOR_THREAD_ID};
 use crate::{network, network_quality, wlan};
 use crate::{report_error_log, report_info_log};
 
@@ -79,38 +78,9 @@ fn run_message_loop() {
             break;
         }
 
-        if msg.message == WM_NETWORK_STATUS_CHANGE {
-            handle_network_status_message(msg.wParam.0 as u32);
-            continue;
-        }
-
-        if msg.message == WM_WIFI_SIGNAL_CHANGE {
-            handle_wifi_signal_message(msg.wParam.0 as u32, msg.lParam.0 as i32);
-            continue;
-        }
-
         unsafe {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
-}
-
-// 处理网络连通性变化：更新状态并输出日志
-fn handle_network_status_message(status: u32) {
-    let connected = status != 0;
-    with_monitor_state(|state| {
-        state.network_connected = connected;
-    });
-
-    if connected {
-        report_info_log!("网络已连接");
-    } else {
-        report_info_log!("网络已断开");
-    }
-}
-
-// 处理 WiFi 信号变化：记录质量与 RSSI
-fn handle_wifi_signal_message(quality: u32, rssi: i32) {
-    report_info_log!("WiFi 信号变化：质量={}，RSSI={}", quality, rssi);
 }

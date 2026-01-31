@@ -18,13 +18,20 @@ use windows::Win32::System::Com::{IConnectionPoint, IConnectionPointContainer};
 
 pub static SOME_EVENT: OnceLock<Mutex<(String, Instant)>> = OnceLock::new();
 
-pub static GLOBAL_REPORT: OnceLock<ThreadsafeFunction<Vec<SomeInfo>>> = OnceLock::new();
+pub static GLOBAL_REPORT_NET_STATUS: OnceLock<ThreadsafeFunction<NetworkStatus>> = OnceLock::new();
+
+pub static GLOBAL_REPORT_WLAN_STATUS: OnceLock<ThreadsafeFunction<WlanStatus>> = OnceLock::new();
+
+pub static GLOBAL_REPORT_NET_QUALITY: OnceLock<ThreadsafeFunction<NetworkQualitySample>> =
+    OnceLock::new();
+
 pub static GLOBAL_LOG: OnceLock<ThreadsafeFunction<String>> = OnceLock::new();
 
 // 用于记录后台监控线程的 ID
 pub static MONITOR_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
-pub static ARGS: AtomicU32 = AtomicU32::new(0);
+pub static THRESHOLD_DROP: AtomicU32 = AtomicU32::new(0);
+pub static THRESHOLD_RECOVER: AtomicU32 = AtomicU32::new(0);
 
 // 监控线程是否已经启动，避免重复创建线程
 pub static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
@@ -38,7 +45,7 @@ pub struct SignalMonitorContext {
     pub last_quality: u32,
 }
 
-pub const DEFAULT_PING_TARGET: &str = "8.8.8.8";
+pub const DEFAULT_PING_TARGET: &str = "www.baidu.com";
 pub const DEFAULT_PING_COUNT: usize = 4;
 pub const DEFAULT_PING_TIMEOUT_MS: u32 = 1000;
 pub const DEFAULT_PROBE_INTERVAL_SECS: u64 = 10;
@@ -48,34 +55,17 @@ pub static QUALITY_RUNNING: AtomicBool = AtomicBool::new(false);
 pub static QUALITY_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
 
 // 网络质量采样结果：用于记录一次探测周期内的主要指标
+#[napi(object)]
 #[derive(Debug, Clone)]
-pub(crate) struct NetworkQualitySample {
-    pub latency_avg_ms: Option<u32>,
-    pub latency_min_ms: Option<u32>,
-    pub latency_max_ms: Option<u32>,
-    pub jitter_ms: Option<u32>,
-    pub packet_loss_percent: Option<f32>,
-    pub tcp_retransmission_percent: Option<f32>,
-    pub tcp_segments_sent: Option<u64>,
-    pub tcp_segments_retransmitted: Option<u64>,
-}
-
-// TCP 统计结果：用于计算重传率并补充其他质量指标
-#[derive(Debug)]
-pub(crate) struct TcpStats {
-    pub retransmission_percent: f32,
-    pub segments_sent: u64,
-    pub segments_retransmitted: u64,
-}
-
-// ICMP 探测结果：用于计算延迟、抖动与丢包
-#[derive(Debug)]
-pub(crate) struct PingStats {
-    pub avg_ms: u32,
-    pub min_ms: u32,
-    pub max_ms: u32,
+pub struct NetworkQualitySample {
+    pub latency_avg_ms: u32,
+    pub latency_min_ms: u32,
+    pub latency_max_ms: u32,
     pub jitter_ms: u32,
-    pub loss_percent: f32,
+    pub packet_loss_percent: f64,
+    pub tcp_retransmission_percent: f64,
+    pub tcp_segments_sent: i64,
+    pub tcp_segments_retransmitted: i64,
 }
 
 // 监控相关的全局状态，统一保存在 global.rs 里
@@ -119,17 +109,39 @@ where
 
 #[napi(object)]
 #[derive(Clone)]
-pub struct SomeInfo {
-    pub pname: String,
-    pub pid: u32,
-    pub title: String,
+pub struct NetworkStatus {
+    pub status: u32,
 }
 
-pub fn report_func(info: Vec<SomeInfo>) {
-    if let Some(tsfn) = GLOBAL_REPORT.get() {
+#[napi(object)]
+#[derive(Clone)]
+pub struct WlanStatus {
+    pub strong: i32,
+    pub quality: u32,
+    pub rssi: i32,
+}
+
+pub fn report_network_status(info: NetworkStatus) {
+    if let Some(tsfn) = GLOBAL_REPORT_NET_STATUS.get() {
         tsfn.call(Ok(info), ThreadsafeFunctionCallMode::NonBlocking);
     } else {
         println!("Warning: No report wnd listener registered yet!");
+    }
+}
+
+pub fn report_wlan_status(info: WlanStatus) {
+    if let Some(tsfn) = GLOBAL_REPORT_WLAN_STATUS.get() {
+        tsfn.call(Ok(info), ThreadsafeFunctionCallMode::NonBlocking);
+    } else {
+        println!("Warning: No report wlan status listener registered yet!");
+    }
+}
+
+pub fn report_net_quality(info: NetworkQualitySample) {
+    if let Some(tsfn) = GLOBAL_REPORT_NET_QUALITY.get() {
+        tsfn.call(Ok(info), ThreadsafeFunctionCallMode::NonBlocking);
+    } else {
+        println!("Warning: No report net quality listener registered yet!");
     }
 }
 

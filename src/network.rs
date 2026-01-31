@@ -6,8 +6,9 @@ use windows::Win32::Networking::NetworkListManager::{
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, IConnectionPointContainer};
 use windows::core::{Interface, Result as WinResult, implement};
 
-use crate::global::{with_monitor_state, with_monitor_state_ref};
-use crate::messages::send_network_status_message;
+use crate::global::{
+    NetworkStatus, report_network_status, with_monitor_state, with_monitor_state_ref,
+};
 use crate::{report_error_log, report_info_log};
 
 // NetworkListManager 事件接收器：将系统连通性变化转发到消息队列
@@ -18,7 +19,13 @@ impl INetworkListManagerEvents_Impl for NetworkListManagerEvents_Impl {
     fn ConnectivityChanged(&self, new_connectivity: NLM_CONNECTIVITY) -> WinResult<()> {
         log_connectivity(new_connectivity);
         let status = connectivity_to_status(new_connectivity);
-        send_network_status_message(status);
+
+        with_monitor_state(|state| {
+            state.network_connected = status != 0;
+        });
+
+        report_network_status(NetworkStatus { status });
+
         Ok(())
     }
 }
@@ -34,14 +41,6 @@ pub fn initialize_network_monitor() -> WinResult<()> {
     let event_sink: INetworkListManagerEvents = NetworkListManagerEvents.into();
     let cookie = unsafe { connection_point.Advise(&event_sink)? };
 
-    with_monitor_state(|state| {
-        state.network_list_manager = Some(network_list_manager);
-        state.connection_point_container = Some(connection_point_container);
-        state.connection_point = Some(connection_point);
-        state.event_sink = Some(event_sink);
-        state.cookie = cookie;
-    });
-
     let status = with_monitor_state_ref(|state| {
         if let Some(manager) = &state.network_list_manager {
             let connectivity = unsafe { manager.GetConnectivity() };
@@ -51,7 +50,16 @@ pub fn initialize_network_monitor() -> WinResult<()> {
         }
     });
 
-    send_network_status_message(status);
+    with_monitor_state(|state| {
+        state.network_connected = status != 0;
+        state.network_list_manager = Some(network_list_manager);
+        state.connection_point_container = Some(connection_point_container);
+        state.connection_point = Some(connection_point);
+        state.event_sink = Some(event_sink);
+        state.cookie = cookie;
+    });
+
+    report_network_status(NetworkStatus { status });
 
     Ok(())
 }

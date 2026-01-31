@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, ToSocketAddrs};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::thread::{self};
@@ -14,8 +14,26 @@ use crate::{report_error_log, report_info_log};
 
 use crate::global::{
     DEFAULT_PING_COUNT, DEFAULT_PING_TARGET, DEFAULT_PING_TIMEOUT_MS, DEFAULT_PROBE_INTERVAL_SECS,
-    IP_FAMILY_IPV4, NetworkQualitySample, PingStats, QUALITY_RUNNING, QUALITY_THREAD, TcpStats,
+    IP_FAMILY_IPV4, NetworkQualitySample, QUALITY_RUNNING, QUALITY_THREAD, report_net_quality,
 };
+
+// TCP 统计结果：用于计算重传率并补充其他质量指标
+#[derive(Debug)]
+struct TcpStats {
+    retransmission_percent: f64,
+    segments_sent: i64,
+    segments_retransmitted: i64,
+}
+
+// ICMP 探测结果：用于计算延迟、抖动与丢包
+#[derive(Debug)]
+struct PingStats {
+    avg_ms: u32,
+    min_ms: u32,
+    max_ms: u32,
+    jitter_ms: u32,
+    loss_percent: f64,
+}
 
 // 启动网络质量探测线程：周期性采样并输出到日志
 pub fn start_quality_probe() {
@@ -31,6 +49,7 @@ pub fn start_quality_probe() {
             let start_at = Instant::now();
             if let Some(sample) = probe_quality_once() {
                 report_quality_sample(&sample);
+                report_net_quality(sample);
             }
 
             let elapsed = start_at.elapsed();
@@ -59,19 +78,25 @@ pub fn stop_quality_probe() {
 
 // 执行一次完整的质量探测：包含延迟、丢包和 TCP 重传率
 fn probe_quality_once() -> Option<NetworkQualitySample> {
-    let target = DEFAULT_PING_TARGET.parse::<Ipv4Addr>().ok()?;
+    let target = resolve_ipv4_target(DEFAULT_PING_TARGET)?;
     let ping = measure_latency_and_loss(target, DEFAULT_PING_COUNT, DEFAULT_PING_TIMEOUT_MS);
     let tcp_stats = query_tcp_stats();
 
     Some(NetworkQualitySample {
-        latency_avg_ms: ping.as_ref().map(|p| p.avg_ms),
-        latency_min_ms: ping.as_ref().map(|p| p.min_ms),
-        latency_max_ms: ping.as_ref().map(|p| p.max_ms),
-        jitter_ms: ping.as_ref().map(|p| p.jitter_ms),
-        packet_loss_percent: ping.as_ref().map(|p| p.loss_percent),
-        tcp_retransmission_percent: tcp_stats.as_ref().map(|t| t.retransmission_percent),
-        tcp_segments_sent: tcp_stats.as_ref().map(|t| t.segments_sent),
-        tcp_segments_retransmitted: tcp_stats.as_ref().map(|t| t.segments_retransmitted),
+        latency_avg_ms: ping.as_ref().map(|p| p.avg_ms).unwrap_or(0),
+        latency_min_ms: ping.as_ref().map(|p| p.min_ms).unwrap_or(0),
+        latency_max_ms: ping.as_ref().map(|p| p.max_ms).unwrap_or(0),
+        jitter_ms: ping.as_ref().map(|p| p.jitter_ms).unwrap_or(0),
+        packet_loss_percent: ping.as_ref().map(|p| p.loss_percent).unwrap_or(0.0),
+        tcp_retransmission_percent: tcp_stats
+            .as_ref()
+            .map(|t| t.retransmission_percent)
+            .unwrap_or(0.0),
+        tcp_segments_sent: tcp_stats.as_ref().map(|t| t.segments_sent).unwrap_or(0),
+        tcp_segments_retransmitted: tcp_stats
+            .as_ref()
+            .map(|t| t.segments_retransmitted)
+            .unwrap_or(0),
     })
 }
 
@@ -147,7 +172,7 @@ fn measure_latency_and_loss(target: Ipv4Addr, count: usize, timeout_ms: u32) -> 
     let sum: u32 = rtts.iter().copied().sum();
     let avg_ms = sum / rtts.len() as u32;
     let jitter_ms = compute_jitter(&rtts);
-    let loss_percent = ((count - success_count) as f32 / count as f32) * 100.0;
+    let loss_percent = ((count - success_count) as f64 / count as f64) * 100.0;
 
     Some(PingStats {
         avg_ms,
@@ -180,18 +205,30 @@ fn query_tcp_stats() -> Option<TcpStats> {
         return None;
     }
 
-    let segments_sent = stats.dwOutSegs as u64;
-    let segments_retransmitted = stats.dwRetransSegs as u64;
+    let segments_sent = stats.dwOutSegs as i64;
+    let segments_retransmitted = stats.dwRetransSegs as i64;
     let total = segments_sent + segments_retransmitted;
     let retransmission_percent = if total == 0 {
         0.0
     } else {
-        (segments_retransmitted as f32 / total as f32) * 100.0
+        (segments_retransmitted as f64 / total as f64) * 100.0
     };
 
     Some(TcpStats {
         retransmission_percent,
         segments_sent,
         segments_retransmitted,
+    })
+}
+
+fn resolve_ipv4_target(target: &str) -> Option<Ipv4Addr> {
+    if let Ok(ipv4) = target.parse::<Ipv4Addr>() {
+        return Some(ipv4);
+    }
+
+    let mut addrs = (target, 0).to_socket_addrs().ok()?;
+    addrs.find_map(|addr| match addr.ip() {
+        std::net::IpAddr::V4(ipv4) => Some(ipv4),
+        std::net::IpAddr::V6(_) => None,
     })
 }
