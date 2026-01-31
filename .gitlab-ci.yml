@@ -1,0 +1,125 @@
+stages:
+  - lint
+  - build
+  - publish
+
+variables:
+  # 全局变量
+  MACOSX_DEPLOYMENT_TARGET: '10.13'
+  CARGO_INCREMENTAL: '1'
+  PNPM_HOME: ${CI_PROJECT_DIR}/.pnpm
+  PATH: ${CI_PROJECT_DIR}/.pnpm:$PATH
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .pnpm-store
+    - target/
+  policy: pull-push
+
+# 基础环境模版
+.base-linux:
+  image: node:20-buster
+  before_script:
+    - corepack enable
+    - corepack prepare pnpm@10.27.0 --activate
+    - pnpm config set store-dir .pnpm-store
+    # 安装 Rust (Linux Runner 必须步骤)
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    - source $HOME/.cargo/env
+
+# =======================
+# 1. Lint 阶段
+# =======================
+lint:
+  stage: lint
+  extends: .base-linux
+  script:
+    - rustup component add clippy rustfmt
+    - pnpm install
+    - pnpm lint
+    - cargo fmt -- --check
+    - cargo clippy
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+
+# =======================
+# 2. Build 阶段 (全能构建)
+# =======================
+# 注意：这里不再区分 build-linux 或 build-windows
+# 而是用同一个任务，通过 matrix 并行构建不同目标
+build-all:
+  stage: build
+  extends: .base-linux
+  # 【重要】删除了 tags: windows，这样你的 #52/#53 Runner 就能接单了
+  script:
+    # 1. 安装 Zig (这是在 Linux 上构建 Windows 版的关键)
+    - echo "Installing Zig..."
+    - curl -L https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar -J -x
+    - export PATH=$PWD/zig-linux-x86_64-0.13.0:$PATH
+    - zig version
+
+    # 2. 安装依赖
+    - pnpm install
+
+    # 3. 执行构建
+    # 逻辑：如果是 Windows 目标，自动加上 --zig 参数
+    - |
+      echo "Building for target: $TARGET"
+      if [[ "$TARGET" == *"windows"* ]]; then
+        echo "Detected Windows target, using Zig cross-compilation..."
+        # --zig: 使用 Zig 编译
+        # --platform: 只生成文件，不加载 (防止报错)
+        pnpm build --target $TARGET --zig --platform
+      else
+        # 其他 Linux 目标
+        pnpm build --target $TARGET --zig --platform
+      fi
+
+  parallel:
+    matrix:
+      - TARGET:
+          # --- Windows 目标 (由 Linux 代工) ---
+          - x86_64-pc-windows-msvc
+          # - aarch64-pc-windows-msvc # 如果需要 ARM64 Windows 就打开
+
+          # --- Linux 目标 (如果不需要可以注释掉) ---
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+
+  artifacts:
+    name: 'bindings-$TARGET'
+    paths:
+      - '*.node'
+    expire_in: 1 day
+
+# =======================
+# 3. Publish 阶段
+# =======================
+pack-tarball:
+  stage: publish
+  extends: .base-linux
+  needs:
+    - job: build-all
+      artifacts: true
+  script:
+    - pnpm install
+
+    # 创建 npm 目录结构
+    - pnpm exec napi create-npm-dirs
+
+    # 将构建好的 .node 文件归位
+    - pnpm artifacts
+
+    # 检查结果
+    - ls -R npm/
+
+    # 打包
+    - pnpm pack
+    - ls -lh *.tgz
+
+  artifacts:
+    name: 'package-tarball-$CI_COMMIT_REF_SLUG'
+    paths:
+      - '*.tgz'
+    expire_in: 7 days
