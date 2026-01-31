@@ -1,87 +1,55 @@
-# `@napi-rs/package-template`
+# perception-network-status
 
-![https://github.com/napi-rs/package-template/actions](https://github.com/napi-rs/package-template/workflows/CI/badge.svg)
+基于 Rust 与 Windows API 的网络状态与质量监控组件，提供网络连通性、WLAN 信号与网络质量指标采样能力，并通过 N-API 供 Node.js 调用。
 
-> Template project for writing node packages with napi-rs.
+## 功能特性
 
-# Usage
+- 网络连通性监控：监听系统网络连接变化
+- WLAN 信号监控：信号质量变化与弱信号状态
+- 网络质量探测：延迟（RTT）、丢包率、抖动、TCP 重传率等指标
+- 后台线程持续采样，日志与回调双通道输出
 
-1. Click **Use this template**.
-2. **Clone** your project.
-3. Run `pnpm install` to install dependencies.
-4. Run `pnpm napi rename -n [@your-scope/package-name] -b [binary-name]` command under the project folder to rename your package.
+## 运行环境
 
-## Install this test package
+- Windows 平台
+- Rust 与 cargo
+- Node.js（N-API）
 
-```bash
-pnpm add @napi-rs/package-template
-```
+## 模块说明
 
-## Ability
+- 入口与 N-API 绑定：[src/lib.rs](./src/lib.rs)
+- 监控线程与消息循环：[src/monitor.rs](./src/monitor.rs)
+- 网络连通性监控：[src/network.rs](./src/network.rs)
+- WLAN 信号监控：[src/wlan.rs](./src/wlan.rs)
+- 网络质量探测：[src/network_quality.rs](./src/network_quality.rs)
+- 全局状态与回调注册：[src/global.rs](./src/global.rs)
+- 线程消息投递：[src/messages.rs](./src/messages.rs)
 
-### Build
+## 网络质量指标说明
 
-After `pnpm build/npm run build` command, you can see `package-template.[darwin|win32|linux].node` file in project root. This is the native addon built from [lib.rs](./src/lib.rs).
+- 延迟（Latency/RTT）：ICMP Echo 往返时间
+- 丢包率（Packet Loss）：探测包未返回比例
+- 稳定性（Retransmission）：TCP 重传率
+- 其他指标：抖动、发送段/重传段数量
 
-### Test
+## 配置说明
 
-With [ava](https://github.com/avajs/ava), run `pnpm test/npm run test` to testing native addon. You can also switch to another testing framework if you want.
+网络质量探测的默认参数在全局配置中定义：
 
-### CI
+- DEFAULT_PING_TARGET：探测目标（支持 IPv4 或域名）
+- DEFAULT_PING_COUNT：每次探测的回包次数
+- DEFAULT_PING_TIMEOUT_MS：单次探测超时
+- DEFAULT_PROBE_INTERVAL_SECS：探测间隔
 
-With GitHub Actions, each commit and pull request will be built and tested automatically in [`node@20`, `@node22`] x [`macOS`, `Linux`, `Windows`] matrix. You will never be afraid of the native addon broken in these platforms.
+## 使用方式（示例）
 
-### Release
+项目作为 N-API 插件使用，需在 Node 侧初始化并注册回调，然后启动后台监控线程。
 
-Release native package is very difficult in old days. Native packages may ask developers who use it to install `build toolchain` like `gcc/llvm`, `node-gyp` or something more.
+> 具体 Node.js 调用示例请参考项目内现有测试或业务调用代码。
 
-With `GitHub actions`, we can easily prebuild a `binary` for major platforms. And with `N-API`, we should never be afraid of **ABI Compatible**.
-
-The other problem is how to deliver prebuild `binary` to users. Downloading it in `postinstall` script is a common way that most packages do it right now. The problem with this solution is it introduced many other packages to download binary that has not been used by `runtime codes`. The other problem is some users may not easily download the binary from `GitHub/CDN` if they are behind a private network (But in most cases, they have a private NPM mirror).
-
-In this package, we choose a better way to solve this problem. We release different `npm packages` for different platforms. And add it to `optionalDependencies` before releasing the `Major` package to npm.
-
-`NPM` will choose which native package should download from `registry` automatically. You can see [npm](./npm) dir for details. And you can also run `pnpm add @napi-rs/package-template` to see how it works.
-
-## Develop requirements
-
-- Install the latest `Rust`
-- Install `Node.js@10+` which fully supported `Node-API`
-- Install `pnpm@1.x`
-
-## Test in local
-
-- pnpm
-- pnpm build
-- pnpm test
-
-And you will see:
+## 构建与检查
 
 ```bash
-$ ava --verbose
-
-  ✔ sync function from native code
-  ✔ sleep function from native code (201ms)
-  ─
-
-  2 tests passed
-✨  Done in 1.12s.
+cargo fmt
+cargo clippy
 ```
-
-## Release package
-
-Ensure you have set your **NPM_TOKEN** in the `GitHub` project setting.
-
-In `Settings -> Secrets`, add **NPM_TOKEN** into it.
-
-When you want to release the package:
-
-```bash
-npm version [<newversion> | major | minor | patch | premajor | preminor | prepatch | prerelease [--preid=<prerelease-id>] | from-git]
-
-git push
-```
-
-GitHub actions will do the rest job for you.
-
-> WARN: Don't run `npm publish` manually.
