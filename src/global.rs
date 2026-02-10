@@ -36,6 +36,14 @@ pub static THRESHOLD_RECOVER: AtomicU32 = AtomicU32::new(0);
 // 监控线程是否已经启动，避免重复创建线程
 pub static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
 
+// 当前网络是否具备互联网连通性。
+//
+// 说明：
+// - 监控线程（COM/NLM 回调）与 WLAN 回调可能运行在不同线程。
+// - 原先将 network_connected 放在 thread_local 的 MonitorState 中，会导致其他线程看到的值始终是默认 false。
+// - 因此把“是否联网”提升为跨线程可见的原子状态，避免线程局部存储带来的状态割裂。
+pub static NETWORK_CONNECTED: AtomicBool = AtomicBool::new(false);
+
 // WLAN 信号强度监控上下文：保存阈值与当前状态，供回调使用
 pub struct SignalMonitorContext {
     pub wlan_handle: HANDLE,
@@ -70,7 +78,6 @@ pub struct NetworkQualitySample {
 
 // 监控相关的全局状态，统一保存在 global.rs 里
 pub struct MonitorState {
-    pub network_connected: bool,
     pub network_list_manager: Option<INetworkListManager>,
     pub connection_point_container: Option<IConnectionPointContainer>,
     pub connection_point: Option<IConnectionPoint>,
@@ -82,7 +89,6 @@ pub struct MonitorState {
 
 thread_local! {
     pub static MONITOR_STATE: RefCell<MonitorState> = const { RefCell::new(MonitorState {
-        network_connected: false,
         network_list_manager: None,
         connection_point_container: None,
         connection_point: None,
@@ -98,13 +104,6 @@ where
     F: FnOnce(&mut MonitorState) -> R,
 {
     MONITOR_STATE.with(|state| action(&mut state.borrow_mut()))
-}
-
-pub fn with_monitor_state_ref<F, R>(action: F) -> R
-where
-    F: FnOnce(&MonitorState) -> R,
-{
-    MONITOR_STATE.with(|state| action(&state.borrow()))
 }
 
 #[napi(object)]
@@ -217,4 +216,23 @@ macro_rules! report_info_log {
 
 pub fn get_current_time() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S.%3f").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NETWORK_CONNECTED;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn network_connected_is_visible_across_threads() {
+        NETWORK_CONNECTED.store(false, Ordering::SeqCst);
+
+        let handle = std::thread::spawn(|| {
+            NETWORK_CONNECTED.store(true, Ordering::SeqCst);
+        });
+        handle.join().unwrap();
+
+        assert!(NETWORK_CONNECTED.load(Ordering::SeqCst));
+        NETWORK_CONNECTED.store(false, Ordering::SeqCst);
+    }
 }

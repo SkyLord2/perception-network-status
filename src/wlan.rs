@@ -13,8 +13,8 @@ use windows::Win32::NetworkManagement::WiFi::{
 use windows::core::{Error as WinError, GUID, HRESULT, Result as WinResult};
 
 use crate::global::{
-    SignalMonitorContext, THRESHOLD_DROP, THRESHOLD_RECOVER, WlanStatus, report_wlan_status,
-    with_monitor_state, with_monitor_state_ref,
+    NETWORK_CONNECTED, SignalMonitorContext, THRESHOLD_DROP, THRESHOLD_RECOVER, WlanStatus,
+    report_wlan_status, with_monitor_state,
 };
 use crate::{report_error_log, report_info_log};
 
@@ -220,15 +220,15 @@ fn update_signal_state(context: &mut SignalMonitorContext, quality: u32, rssi: i
             1
         };
 
-        with_monitor_state_ref(|state| {
-            if state.network_connected {
-                report_wlan_status(WlanStatus {
-                    strong,
-                    quality,
-                    rssi,
-                });
-            }
-        });
+        // WLAN 回调可能运行在非监控线程上，因此不能依赖 thread_local 的 MonitorState；
+        // 这里改用跨线程的原子网络状态来判断是否要上报。
+        if NETWORK_CONNECTED.load(Ordering::SeqCst) {
+            report_wlan_status(WlanStatus {
+                strong,
+                quality,
+                rssi,
+            });
+        }
     }
 }
 

@@ -6,10 +6,9 @@ use windows::Win32::Networking::NetworkListManager::{
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, IConnectionPointContainer};
 use windows::core::{Interface, Result as WinResult, implement};
 
-use crate::global::{
-    NetworkStatus, report_network_status, with_monitor_state, with_monitor_state_ref,
-};
+use crate::global::{NETWORK_CONNECTED, NetworkStatus, report_network_status, with_monitor_state};
 use crate::{report_error_log, report_info_log};
+use std::sync::atomic::Ordering;
 
 // NetworkListManager 事件接收器：将系统连通性变化转发到消息队列
 #[implement(INetworkListManagerEvents)]
@@ -19,13 +18,17 @@ impl INetworkListManagerEvents_Impl for NetworkListManagerEvents_Impl {
     fn ConnectivityChanged(&self, new_connectivity: NLM_CONNECTIVITY) -> WinResult<()> {
         log_connectivity(new_connectivity);
         let status = connectivity_to_status(new_connectivity);
+        let is_connected = status != 0;
 
-        with_monitor_state(|state| {
-            state.network_connected = status != 0;
-        });
-
-        report_network_status(NetworkStatus { status });
-
+        let was_connected = NETWORK_CONNECTED.swap(is_connected, Ordering::SeqCst);
+        report_info_log!(
+            "当前网络状态：{}, 之前状态：{}",
+            is_connected,
+            was_connected
+        );
+        if was_connected != is_connected {
+            report_network_status(NetworkStatus { status });
+        }
         Ok(())
     }
 }
@@ -41,17 +44,12 @@ pub fn initialize_network_monitor() -> WinResult<()> {
     let event_sink: INetworkListManagerEvents = NetworkListManagerEvents.into();
     let cookie = unsafe { connection_point.Advise(&event_sink)? };
 
-    let status = with_monitor_state_ref(|state| {
-        if let Some(manager) = &state.network_list_manager {
-            let connectivity = unsafe { manager.GetConnectivity() };
-            connectivity.map(connectivity_to_status).unwrap_or(0)
-        } else {
-            0
-        }
-    });
+    let connectivity = unsafe { network_list_manager.GetConnectivity() };
+    let status = connectivity.map(connectivity_to_status).unwrap_or(0);
+    report_info_log!("初始化网络监控，当前状态：{}", status);
+    NETWORK_CONNECTED.store(status != 0, Ordering::SeqCst);
 
     with_monitor_state(|state| {
-        state.network_connected = status != 0;
         state.network_list_manager = Some(network_list_manager);
         state.connection_point_container = Some(connection_point_container);
         state.connection_point = Some(connection_point);
@@ -59,13 +57,16 @@ pub fn initialize_network_monitor() -> WinResult<()> {
         state.cookie = cookie;
     });
 
-    report_network_status(NetworkStatus { status });
+    if status == 0 {
+        report_network_status(NetworkStatus { status });
+    }
 
     Ok(())
 }
 
 // 清理网络监控：注销事件并释放 COM 资源
 pub fn cleanup_network_monitor() {
+    NETWORK_CONNECTED.store(false, Ordering::SeqCst);
     with_monitor_state(|state| {
         if let Some(connection_point) = &state.connection_point
             && state.cookie != 0
