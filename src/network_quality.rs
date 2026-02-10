@@ -1,6 +1,6 @@
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, ToSocketAddrs};
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 use std::thread::{self};
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,8 @@ struct TcpStats {
     segments_retransmitted: i64,
 }
 
+static TCP_STATS_BASELINE: OnceLock<Mutex<Option<(i64, i64)>>> = OnceLock::new();
+
 // ICMP 探测结果：用于计算延迟、抖动与丢包
 #[derive(Debug)]
 struct PingStats {
@@ -48,6 +50,7 @@ pub fn start_quality_probe() {
 
     let handle = thread::spawn(|| {
         let interval = Duration::from_secs(DEFAULT_PROBE_INTERVAL_SECS);
+        init_tcp_stats_baseline();
         while QUALITY_RUNNING.load(Ordering::SeqCst) {
             let start_at = Instant::now();
             if let Some(sample) = probe_quality_once() {
@@ -77,6 +80,7 @@ pub fn stop_quality_probe() {
     {
         let _ = handle.join();
     }
+    reset_tcp_stats_baseline();
 }
 
 // 执行一次完整的质量探测：包含延迟、丢包和 TCP 重传率
@@ -164,7 +168,7 @@ fn measure_latency_and_loss(target: Ipv4Addr, count: usize, timeout_ms: u32) -> 
         let mut reply_buffer = vec![0u8; reply_size as usize];
         // IcmpSendEcho 的目标 IP 字节序必须使用小端序
         // 虽然网络字节序为大端序，但是 x86/x64/ARM 架构使用是小端序
-        // 192.168.0.1 被存储为 01 00 A8 C0 
+        // 192.168.0.1 被存储为 01 00 A8 C0
         // 如果以大端序传入，实际ping的是 1.0.168.192
         let response_count = unsafe {
             IcmpSendEcho(
@@ -302,23 +306,88 @@ fn measure_tcp_handshake_rtt(
 
 // 读取系统 TCP 统计并计算重传率
 fn query_tcp_stats() -> Option<TcpStats> {
+    let (current_sent, current_retrans) = read_tcp_counters()?;
+    let baseline_lock = TCP_STATS_BASELINE.get_or_init(|| Mutex::new(None));
+    let mut baseline = baseline_lock.lock().unwrap();
+    let previous = *baseline;
+    let stats = compute_interval_tcp_stats(&mut baseline, (current_sent, current_retrans));
+
+    if cfg!(debug_assertions) {
+        report_info_log!(
+            "TCP 重传率（周期内）：prev={:?} curr=({},{}) delta=({},{}) percent={:.6}%",
+            previous,
+            current_sent,
+            current_retrans,
+            stats.segments_sent,
+            stats.segments_retransmitted,
+            stats.retransmission_percent
+        );
+    }
+
+    Some(stats)
+}
+
+fn init_tcp_stats_baseline() {
+    let baseline_lock = TCP_STATS_BASELINE.get_or_init(|| Mutex::new(None));
+    let mut baseline = baseline_lock.lock().unwrap();
+    if baseline.is_some() {
+        return;
+    }
+    if let Some((sent, retrans)) = read_tcp_counters() {
+        *baseline = Some((sent, retrans));
+        if cfg!(debug_assertions) {
+            report_info_log!("TCP 重传率（周期开始）：baseline=({},{})", sent, retrans);
+        }
+    }
+}
+
+fn reset_tcp_stats_baseline() {
+    if let Some(lock) = TCP_STATS_BASELINE.get() {
+        *lock.lock().unwrap() = None;
+    }
+}
+
+fn read_tcp_counters() -> Option<(i64, i64)> {
     let mut stats = MIB_TCPSTATS_LH::default();
     let result = unsafe { GetTcpStatisticsEx(&mut stats, IP_FAMILY_IPV4) };
     if result != ERROR_SUCCESS.0 {
         report_error_log!("GetTcpStatisticsEx 失败: {:?}", WIN32_ERROR(result));
         return None;
     }
+    Some((stats.dwOutSegs as i64, stats.dwRetransSegs as i64))
+}
 
-    let segments_sent = stats.dwOutSegs as i64;
-    let segments_retransmitted = stats.dwRetransSegs as i64;
-    let retransmission_percent =
-        compute_retransmission_percent_out(segments_sent, segments_retransmitted);
+fn compute_interval_tcp_stats(baseline: &mut Option<(i64, i64)>, current: (i64, i64)) -> TcpStats {
+    let (current_sent, current_retrans) = current;
+    let Some((prev_sent, prev_retrans)) = *baseline else {
+        *baseline = Some(current);
+        return TcpStats {
+            retransmission_percent: 0.0,
+            segments_sent: 0,
+            segments_retransmitted: 0,
+        };
+    };
 
-    Some(TcpStats {
+    if current_sent < prev_sent || current_retrans < prev_retrans {
+        *baseline = Some(current);
+        return TcpStats {
+            retransmission_percent: 0.0,
+            segments_sent: 0,
+            segments_retransmitted: 0,
+        };
+    }
+
+    let delta_sent = current_sent - prev_sent;
+    let delta_retrans = current_retrans - prev_retrans;
+    *baseline = Some(current);
+
+    let retransmission_percent = compute_retransmission_percent_out(delta_sent, delta_retrans);
+
+    TcpStats {
         retransmission_percent,
-        segments_sent,
-        segments_retransmitted,
-    })
+        segments_sent: delta_sent,
+        segments_retransmitted: delta_retrans,
+    }
 }
 
 fn resolve_ipv4_target(target: &str) -> Option<Ipv4Addr> {
@@ -368,7 +437,10 @@ fn compute_retransmission_percent_total(segments_sent: i64, segments_retransmitt
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_retransmission_percent_out, compute_retransmission_percent_total};
+    use super::{
+        compute_interval_tcp_stats, compute_retransmission_percent_out,
+        compute_retransmission_percent_total,
+    };
 
     #[test]
     fn retransmission_percent_formulas_match_expectations() {
@@ -379,5 +451,41 @@ mod tests {
         assert!(out > total);
         assert!((out - 0.776).abs() < 0.01);
         assert!((total - 0.770).abs() < 0.01);
+    }
+
+    #[test]
+    fn interval_stats_resets_on_first_sample() {
+        let mut baseline = None;
+        let stats = compute_interval_tcp_stats(&mut baseline, (100, 10));
+        assert_eq!(stats.segments_sent, 0);
+        assert_eq!(stats.segments_retransmitted, 0);
+        assert_eq!(stats.retransmission_percent, 0.0);
+        assert_eq!(baseline, Some((100, 10)));
+    }
+
+    #[test]
+    fn interval_stats_isolated_across_cycles() {
+        let mut baseline = Some((100, 10));
+        let stats1 = compute_interval_tcp_stats(&mut baseline, (150, 12));
+        assert_eq!(stats1.segments_sent, 50);
+        assert_eq!(stats1.segments_retransmitted, 2);
+        assert!((stats1.retransmission_percent - 4.0).abs() < 1e-9);
+        assert_eq!(baseline, Some((150, 12)));
+
+        let stats2 = compute_interval_tcp_stats(&mut baseline, (180, 12));
+        assert_eq!(stats2.segments_sent, 30);
+        assert_eq!(stats2.segments_retransmitted, 0);
+        assert_eq!(stats2.retransmission_percent, 0.0);
+        assert_eq!(baseline, Some((180, 12)));
+    }
+
+    #[test]
+    fn interval_stats_handles_counter_reset() {
+        let mut baseline = Some((200, 20));
+        let stats = compute_interval_tcp_stats(&mut baseline, (50, 2));
+        assert_eq!(stats.segments_sent, 0);
+        assert_eq!(stats.segments_retransmitted, 0);
+        assert_eq!(stats.retransmission_percent, 0.0);
+        assert_eq!(baseline, Some((50, 2)));
     }
 }
