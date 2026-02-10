@@ -53,7 +53,7 @@ pub struct SignalMonitorContext {
 }
 
 pub const DEFAULT_PING_TARGET: &str = "www.baidu.com";
-pub const DEFAULT_PING_COUNT: usize = 4;
+pub const DEFAULT_PING_COUNT: usize = 10;
 pub const DEFAULT_PING_TIMEOUT_MS: u32 = 3000;
 pub const DEFAULT_PROBE_INTERVAL_SECS: u64 = 10;
 pub const IP_FAMILY_IPV4: u32 = 2;

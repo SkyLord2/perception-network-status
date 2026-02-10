@@ -231,6 +231,8 @@ fn measure_latency_and_loss(target: Ipv4Addr, count: usize, timeout_ms: u32) -> 
 }
 
 // 计算简单抖动指标：相邻 RTT 差值的平均值
+// "平均包对包延迟变动" (Mean Packet-to-Packet Delay Variation, PDV)。
+// $Jitter = \frac{\sum_{i=1}^{N-1} |RTT_i - RTT_{i+1}|}{N-1}$
 fn compute_jitter(rtts: &[u32]) -> u32 {
     if rtts.len() < 2 {
         return 0;
