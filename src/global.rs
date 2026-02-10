@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
@@ -10,7 +10,6 @@ use chrono::Local;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 use napi_derive::napi;
 
-use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Networking::NetworkListManager::{
     INetworkListManager, INetworkListManagerEvents,
 };
@@ -46,7 +45,7 @@ pub static NETWORK_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 // WLAN 信号强度监控上下文：保存阈值与当前状态，供回调使用
 pub struct SignalMonitorContext {
-    pub wlan_handle: HANDLE,
+    pub wlan_handle: isize,
     pub threshold_drop: u32,
     pub threshold_recover: u32,
     pub is_signal_weak: bool,
@@ -83,8 +82,7 @@ pub struct MonitorState {
     pub connection_point: Option<IConnectionPoint>,
     pub event_sink: Option<INetworkListManagerEvents>,
     pub cookie: u32,
-    pub wlan_handle: Option<HANDLE>,
-    pub signal_context: Option<Box<SignalMonitorContext>>,
+    pub signal_context: Option<Arc<Mutex<SignalMonitorContext>>>,
 }
 
 thread_local! {
@@ -94,7 +92,6 @@ thread_local! {
         connection_point: None,
         event_sink: None,
         cookie: 0,
-        wlan_handle: None,
         signal_context: None,
     }) };
 }

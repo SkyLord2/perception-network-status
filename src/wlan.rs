@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE, WIN32_ERROR};
 use windows::Win32::NetworkManagement::WiFi::{
@@ -54,17 +55,16 @@ pub fn initialize_wlan_monitor() -> WinResult<()> {
         last_quality = quality;
     }
 
-    let mut context = Box::new(SignalMonitorContext {
-        wlan_handle,
+    let context = Arc::new(Mutex::new(SignalMonitorContext {
+        wlan_handle: wlan_handle.0 as isize,
         threshold_drop,
         threshold_recover,
         is_signal_weak,
         last_quality,
-    });
-    let context_ptr = context.as_mut() as *mut SignalMonitorContext as *mut c_void;
+    }));
+    let context_ptr = Arc::into_raw(Arc::clone(&context)) as *mut c_void;
 
     with_monitor_state(|state| {
-        state.wlan_handle = Some(wlan_handle);
         state.signal_context = Some(context);
     });
 
@@ -87,7 +87,17 @@ pub fn initialize_wlan_monitor() -> WinResult<()> {
 // 释放 WLAN 监控资源：注销通知并关闭句柄
 pub fn cleanup_wlan_monitor() {
     with_monitor_state(|state| {
-        if let Some(handle) = state.wlan_handle {
+        if let Some(context) = state.signal_context.take() {
+            let context_ptr = Arc::as_ptr(&context);
+            let handle = context
+                .lock()
+                .map(|ctx| HANDLE(ctx.wlan_handle as *mut c_void))
+                .unwrap_or(HANDLE(null_mut()));
+            if handle.0.is_null() {
+                unsafe { Arc::decrement_strong_count(context_ptr) };
+                return;
+            }
+
             let _ = unsafe {
                 WlanRegisterNotification(
                     handle,
@@ -100,10 +110,8 @@ pub fn cleanup_wlan_monitor() {
                 )
             };
             let _ = unsafe { WlanCloseHandle(handle, None) };
+            unsafe { Arc::decrement_strong_count(context_ptr) };
         }
-
-        state.wlan_handle = None;
-        state.signal_context = None;
     });
 }
 
@@ -121,20 +129,26 @@ unsafe extern "system" fn wlan_notification_callback(
         return;
     }
 
-    let context = unsafe { &mut *(context as *mut SignalMonitorContext) };
+    let context = context as *const Mutex<SignalMonitorContext>;
+    unsafe { Arc::increment_strong_count(context) };
+    let context = unsafe { Arc::from_raw(context) };
     let interface_guid = &notification.InterfaceGuid;
 
-    if notification.NotificationCode == wlan_notification_msm_disconnected.0 as u32 {
-        context.last_quality = 0;
-        context.is_signal_weak = false;
-        return;
-    }
+    if let Ok(mut context) = context.lock() {
+        if notification.NotificationCode == wlan_notification_msm_disconnected.0 as u32 {
+            context.last_quality = 0;
+            context.is_signal_weak = false;
+            return;
+        }
 
-    if (notification.NotificationCode == wlan_notification_msm_connected.0 as u32
-        || notification.NotificationCode == wlan_notification_msm_signal_quality_change.0 as u32)
-        && let Some((quality, rssi)) = query_interface_signal(context.wlan_handle, interface_guid)
-    {
-        update_signal_state(context, quality, rssi);
+        if (notification.NotificationCode == wlan_notification_msm_connected.0 as u32
+            || notification.NotificationCode
+                == wlan_notification_msm_signal_quality_change.0 as u32)
+            && let Some((quality, rssi)) =
+                query_interface_signal(HANDLE(context.wlan_handle as *mut c_void), interface_guid)
+        {
+            update_signal_state(&mut context, quality, rssi);
+        }
     }
 }
 
