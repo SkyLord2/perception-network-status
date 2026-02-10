@@ -1,13 +1,13 @@
-use std::net::{Ipv4Addr, ToSocketAddrs};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, ToSocketAddrs};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 use std::thread::{self};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{ERROR_SUCCESS, WIN32_ERROR};
+use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
-    GetTcpStatisticsEx, ICMP_ECHO_REPLY, IP_OPTION_INFORMATION, IcmpCloseHandle, IcmpCreateFile,
-    IcmpSendEcho, MIB_TCPSTATS_LH,
+    GetTcpStatisticsEx, ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
+    MIB_TCPSTATS_LH,
 };
 
 use crate::{report_error_log, report_info_log};
@@ -33,6 +33,9 @@ struct PingStats {
     max_ms: u32,
     jitter_ms: u32,
     loss_percent: f64,
+    success_count: usize,
+    last_error: u32,
+    last_reply_status: Option<u32>,
 }
 
 // 启动网络质量探测线程：周期性采样并输出到日志
@@ -79,7 +82,26 @@ pub fn stop_quality_probe() {
 // 执行一次完整的质量探测：包含延迟、丢包和 TCP 重传率
 fn probe_quality_once() -> Option<NetworkQualitySample> {
     let target = resolve_ipv4_target(DEFAULT_PING_TARGET)?;
-    let ping = measure_latency_and_loss(target, DEFAULT_PING_COUNT, DEFAULT_PING_TIMEOUT_MS);
+    let mut ping = measure_latency_and_loss(target, DEFAULT_PING_COUNT, DEFAULT_PING_TIMEOUT_MS);
+    if let Some(stats) = ping.as_ref()
+        && stats.success_count == 0
+    {
+        report_info_log!(
+            "ICMP 探测全失败，切换为 TCP 握手 RTT 探测：target={} ipv4={} success_count={}/{} last_error={} last_reply_status={:?}",
+            DEFAULT_PING_TARGET,
+            target,
+            stats.success_count,
+            DEFAULT_PING_COUNT,
+            stats.last_error,
+            stats.last_reply_status
+        );
+        ping = measure_tcp_handshake_rtt(
+            DEFAULT_PING_TARGET,
+            443,
+            DEFAULT_PING_COUNT,
+            Duration::from_millis(DEFAULT_PING_TIMEOUT_MS as u64),
+        );
+    }
     let tcp_stats = query_tcp_stats();
 
     Some(NetworkQualitySample {
@@ -102,14 +124,19 @@ fn probe_quality_once() -> Option<NetworkQualitySample> {
 
 // 记录采样结果：统一输出，便于日志聚合与后续消费
 fn report_quality_sample(sample: &NetworkQualitySample) {
+    let retransmission_percent_total = compute_retransmission_percent_total(
+        sample.tcp_segments_sent,
+        sample.tcp_segments_retransmitted,
+    );
     report_info_log!(
-        "网络质量采样：延迟avg={:?}ms,min={:?}ms,max={:?}ms,jitter={:?}ms,丢包={:?}%,重传率={:?}%,发送段={:?},重传段={:?}",
+        "网络质量采样：延迟avg={:?}ms,min={:?}ms,max={:?}ms,jitter={:?}ms,丢包={:?}%,重传率(out)={:?}%,重传率(total)={:?}%,发送段={:?},重传段={:?}",
         sample.latency_avg_ms,
         sample.latency_min_ms,
         sample.latency_max_ms,
         sample.jitter_ms,
         sample.packet_loss_percent,
         sample.tcp_retransmission_percent,
+        retransmission_percent_total,
         sample.tcp_segments_sent,
         sample.tcp_segments_retransmitted
     );
@@ -128,18 +155,24 @@ fn measure_latency_and_loss(target: Ipv4Addr, count: usize, timeout_ms: u32) -> 
 
     let mut rtts = Vec::with_capacity(count);
     let mut success_count = 0usize;
+    let mut last_error = 0u32;
+    let mut last_reply_status: Option<u32> = None;
     let payload = [0u8; 32];
     let reply_size = (std::mem::size_of::<ICMP_ECHO_REPLY>() + payload.len()) as u32;
 
     for _ in 0..count {
         let mut reply_buffer = vec![0u8; reply_size as usize];
+        // IcmpSendEcho 的目标 IP 字节序必须使用小端序
+        // 虽然网络字节序为大端序，但是 x86/x64/ARM 架构使用是小端序
+        // 192.168.0.1 被存储为 01 00 A8 C0 
+        // 如果以大端序传入，实际ping的是 1.0.168.192
         let response_count = unsafe {
             IcmpSendEcho(
                 handle,
-                u32::from(target),
+                u32::from_le_bytes(target.octets()),
                 payload.as_ptr().cast(),
                 payload.len() as u16,
-                Some(&IP_OPTION_INFORMATION::default()),
+                None,
                 reply_buffer.as_mut_ptr().cast(),
                 reply_size,
                 timeout_ms,
@@ -148,10 +181,13 @@ fn measure_latency_and_loss(target: Ipv4Addr, count: usize, timeout_ms: u32) -> 
 
         if response_count > 0 {
             let reply = unsafe { &*(reply_buffer.as_ptr() as *const ICMP_ECHO_REPLY) };
+            last_reply_status = Some(reply.Status);
             if reply.Status == ERROR_SUCCESS.0 {
                 rtts.push(reply.RoundTripTime);
                 success_count += 1;
             }
+        } else {
+            last_error = unsafe { GetLastError().0 };
         }
     }
 
@@ -164,6 +200,9 @@ fn measure_latency_and_loss(target: Ipv4Addr, count: usize, timeout_ms: u32) -> 
             max_ms: 0,
             jitter_ms: 0,
             loss_percent: 100.0,
+            success_count,
+            last_error,
+            last_reply_status,
         });
     }
 
@@ -172,7 +211,8 @@ fn measure_latency_and_loss(target: Ipv4Addr, count: usize, timeout_ms: u32) -> 
     let sum: u32 = rtts.iter().copied().sum();
     let avg_ms = sum / rtts.len() as u32;
     let jitter_ms = compute_jitter(&rtts);
-    let loss_percent = ((count - success_count) as f64 / count as f64) * 100.0;
+    let failure_count = count.saturating_sub(success_count);
+    let loss_percent = (failure_count as f64 / count as f64) * 100.0;
 
     Some(PingStats {
         avg_ms,
@@ -180,6 +220,9 @@ fn measure_latency_and_loss(target: Ipv4Addr, count: usize, timeout_ms: u32) -> 
         max_ms,
         jitter_ms,
         loss_percent,
+        success_count,
+        last_error,
+        last_reply_status,
     })
 }
 
@@ -196,6 +239,67 @@ fn compute_jitter(rtts: &[u32]) -> u32 {
     sum / (rtts.len() as u32 - 1)
 }
 
+fn measure_tcp_handshake_rtt(
+    target: &str,
+    port: u16,
+    count: usize,
+    timeout: Duration,
+) -> Option<PingStats> {
+    let addrs = resolve_ipv4_socket_addrs(target, port)?;
+    let addr = addrs.first().copied()?;
+
+    let mut rtts = Vec::with_capacity(count);
+    let mut success_count = 0usize;
+    let mut last_error = 0u32;
+
+    for _ in 0..count {
+        let start_at = Instant::now();
+        match TcpStream::connect_timeout(&addr.into(), timeout) {
+            Ok(stream) => {
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+                let elapsed_ms = start_at.elapsed().as_millis().min(u128::from(u32::MAX)) as u32;
+                rtts.push(elapsed_ms);
+                success_count += 1;
+            }
+            Err(error) => {
+                last_error = error.raw_os_error().unwrap_or(0) as u32;
+            }
+        }
+    }
+
+    if rtts.is_empty() {
+        return Some(PingStats {
+            avg_ms: 0,
+            min_ms: 0,
+            max_ms: 0,
+            jitter_ms: 0,
+            loss_percent: 100.0,
+            success_count,
+            last_error,
+            last_reply_status: None,
+        });
+    }
+
+    let min_ms = *rtts.iter().min().unwrap();
+    let max_ms = *rtts.iter().max().unwrap();
+    let sum: u32 = rtts.iter().copied().sum();
+    let avg_ms = sum / rtts.len() as u32;
+    let jitter_ms = compute_jitter(&rtts);
+    let failure_count = count.saturating_sub(success_count);
+    let loss_percent = (failure_count as f64 / count as f64) * 100.0;
+
+    Some(PingStats {
+        avg_ms,
+        min_ms,
+        max_ms,
+        jitter_ms,
+        loss_percent,
+        success_count,
+        last_error,
+        last_reply_status: None,
+    })
+}
+
 // 读取系统 TCP 统计并计算重传率
 fn query_tcp_stats() -> Option<TcpStats> {
     let mut stats = MIB_TCPSTATS_LH::default();
@@ -207,12 +311,8 @@ fn query_tcp_stats() -> Option<TcpStats> {
 
     let segments_sent = stats.dwOutSegs as i64;
     let segments_retransmitted = stats.dwRetransSegs as i64;
-    let total = segments_sent + segments_retransmitted;
-    let retransmission_percent = if total == 0 {
-        0.0
-    } else {
-        (segments_retransmitted as f64 / total as f64) * 100.0
-    };
+    let retransmission_percent =
+        compute_retransmission_percent_out(segments_sent, segments_retransmitted);
 
     Some(TcpStats {
         retransmission_percent,
@@ -231,4 +331,53 @@ fn resolve_ipv4_target(target: &str) -> Option<Ipv4Addr> {
         std::net::IpAddr::V4(ipv4) => Some(ipv4),
         std::net::IpAddr::V6(_) => None,
     })
+}
+
+fn resolve_ipv4_socket_addrs(host: &str, port: u16) -> Option<Vec<SocketAddrV4>> {
+    let addrs = (host, port).to_socket_addrs().ok()?;
+    let mut result = Vec::new();
+    for addr in addrs {
+        if let std::net::SocketAddr::V4(v4) = addr {
+            result.push(v4);
+        }
+    }
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+fn compute_retransmission_percent_out(segments_sent: i64, segments_retransmitted: i64) -> f64 {
+    if segments_sent <= 0 {
+        return 0.0;
+    }
+    (segments_retransmitted.max(0) as f64 / segments_sent as f64) * 100.0
+}
+
+fn compute_retransmission_percent_total(segments_sent: i64, segments_retransmitted: i64) -> f64 {
+    let sent = segments_sent.max(0) as f64;
+    let retrans = segments_retransmitted.max(0) as f64;
+    let total = sent + retrans;
+    if total == 0.0 {
+        0.0
+    } else {
+        (retrans / total) * 100.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compute_retransmission_percent_out, compute_retransmission_percent_total};
+
+    #[test]
+    fn retransmission_percent_formulas_match_expectations() {
+        let sent = 4_238_258i64;
+        let retrans = 32_906i64;
+        let out = compute_retransmission_percent_out(sent, retrans);
+        let total = compute_retransmission_percent_total(sent, retrans);
+        assert!(out > total);
+        assert!((out - 0.776).abs() < 0.01);
+        assert!((total - 0.770).abs() < 0.01);
+    }
 }
