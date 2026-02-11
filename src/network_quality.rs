@@ -4,6 +4,8 @@ use std::sync::{Mutex, OnceLock};
 use std::thread::{self};
 use std::time::{Duration, Instant};
 
+use rand::RngExt;
+
 use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, WIN32_ERROR};
 use windows::Win32::NetworkManagement::IpHelper::{
     GetTcpStatisticsEx, ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho,
@@ -49,7 +51,13 @@ pub fn start_quality_probe() {
     }
 
     let handle = thread::spawn(|| {
-        let interval = Duration::from_secs(DEFAULT_PROBE_INTERVAL_SECS);
+        let mut rng = rand::rng();
+        // 生成 [1.0, 1.5] 的随机倍率
+        let jitter_factor = rng.random_range(1.0..=1.5);
+        let base_secs = DEFAULT_PROBE_INTERVAL_SECS as f64;
+        let jitter_secs = jitter_factor * base_secs;
+        // 将随机扰动后的秒数转换为稳定的探测间隔
+        let interval = Duration::from_secs(jitter_secs as u64);
         init_tcp_stats_baseline();
         while QUALITY_RUNNING.load(Ordering::SeqCst) {
             let start_at = Instant::now();

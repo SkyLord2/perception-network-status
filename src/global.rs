@@ -60,6 +60,8 @@ pub const IP_FAMILY_IPV4: u32 = 2;
 
 pub static QUALITY_RUNNING: AtomicBool = AtomicBool::new(false);
 pub static QUALITY_THREAD: OnceLock<Mutex<Option<JoinHandle<()>>>> = OnceLock::new();
+// 网络质量探测是否启用：由初始化参数与运行时开关共同控制
+pub static NET_QUALITY_PROB_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // 网络质量采样结果：用于记录一次探测周期内的主要指标
 #[napi(object)]

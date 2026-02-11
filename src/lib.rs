@@ -16,12 +16,15 @@ use std::time::{Duration, Instant};
 
 use crate::global::{
     GLOBAL_LOG, GLOBAL_REPORT_NET_QUALITY, GLOBAL_REPORT_NET_STATUS, GLOBAL_REPORT_WLAN_STATUS,
-    NetworkQualitySample, NetworkStatus, SOME_EVENT, THRESHOLD_DROP, THRESHOLD_RECOVER, WlanStatus,
+    NET_QUALITY_PROB_ENABLED, NetworkQualitySample, NetworkStatus, SOME_EVENT, THRESHOLD_DROP,
+    THRESHOLD_RECOVER, WlanStatus,
 };
 use crate::monitor::{cleanup_monitor_thread, start_monitor_thread};
+use crate::network_quality::{start_quality_probe, stop_quality_probe};
 
 // Node 侧初始化入口：注册回调、启动监控线程，并推送一次空消息用于握手
 #[napi]
+#[allow(clippy::too_many_arguments)]
 pub fn do_initialize(
     mut report_network_status: ThreadsafeFunction<NetworkStatus>,
     mut report_wlan_status: ThreadsafeFunction<WlanStatus>,
@@ -29,6 +32,7 @@ pub fn do_initialize(
     threshold_recover: u32,
     mut report_net_quality: ThreadsafeFunction<NetworkQualitySample>,
     mut log: ThreadsafeFunction<String>,
+    net_quality_prob_enable: bool,
     env: Env,
 ) -> napi::Result<()> {
     // 仅在初始化阶段持有线程安全函数，随后交由全局缓存管理
@@ -83,6 +87,7 @@ pub fn do_initialize(
     // 保存初始化参数，供 WLAN 阈值等配置在后台线程解析
     THRESHOLD_DROP.store(threshold_drop, Ordering::SeqCst);
     THRESHOLD_RECOVER.store(threshold_recover, Ordering::SeqCst);
+    NET_QUALITY_PROB_ENABLED.store(net_quality_prob_enable, Ordering::SeqCst);
 
     if cfg!(debug_assertions) {
         report_info_log!("[Debug] 当前正处于开发模式运行，开启详细日志...");
@@ -97,4 +102,16 @@ pub fn do_initialize(
     start_monitor_thread();
 
     Ok(())
+}
+
+#[napi]
+pub fn enable_net_quality_prob(enable: bool) {
+    NET_QUALITY_PROB_ENABLED.store(enable, Ordering::SeqCst);
+    if enable {
+        report_info_log!("启用网络质量探测");
+        start_quality_probe();
+    } else {
+        report_info_log!("停止网络质量探测");
+        stop_quality_probe();
+    }
 }

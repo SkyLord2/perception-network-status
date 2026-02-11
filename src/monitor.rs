@@ -8,7 +8,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, PostThreadMessageW, TranslateMessage, WM_QUIT,
 };
 
-use crate::global::{MONITOR_STARTED, MONITOR_THREAD_ID};
+use crate::global::{MONITOR_STARTED, MONITOR_THREAD_ID, NET_QUALITY_PROB_ENABLED};
 use crate::{network, network_quality, wlan};
 use crate::{report_error_log, report_info_log};
 
@@ -37,7 +37,12 @@ pub fn start_monitor_thread() {
             report_error_log!("初始化 WLAN 监控失败: {}", error);
         }
 
-        network_quality::start_quality_probe();
+        // 根据初始化与运行时开关决定是否启动网络质量探测
+        if NET_QUALITY_PROB_ENABLED.load(Ordering::SeqCst) {
+            network_quality::start_quality_probe();
+        } else {
+            report_info_log!("网络质量探测默认关闭，等待显式启用");
+        }
 
         run_message_loop();
 
